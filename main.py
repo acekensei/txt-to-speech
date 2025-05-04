@@ -5,7 +5,8 @@ import os
 from pydub import AudioSegment
 from tkinter import Tk, filedialog
 
-VOICES = ['en-PH-JamesNeural']
+# VOICES = ['en-PH-JamesNeural']
+VOICES = ['en-US-ChristopherNeural']
 VOICE = VOICES[0]
 OUTPUT_FILE = "final_output.mp3"
 MAX_RETRIES = 5
