@@ -1,34 +1,57 @@
 import asyncio
 import edge_tts
-import time
 import os
-from pydub import AudioSegment
+import uuid
 from tkinter import Tk, filedialog
 
 # VOICES = ['en-PH-JamesNeural']
 VOICES = ['en-US-ChristopherNeural']
 VOICE = VOICES[0]
-OUTPUT_FILE = "final_output.mp3"
 MAX_RETRIES = 5
 RETRY_DELAY = 2
 CHARACTER_LIMIT = 5000
+CONCURRENT_LIMIT = 5  # Number of parallel downloads
 
 # Function to split text into chunks within character limit
+# Preserves newlines/paragraphs for better audio pacing
 def split_text(text, limit):
-    words = text.split()
+    lines = text.splitlines()
     chunks = []
     current_chunk = []
-    current_length = 0
-    for word in words:
-        if current_length + len(word) + 1 > limit:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [word]
-            current_length = len(word) + 1
+    current_size = 0
+    
+    for line in lines:
+        line_len = len(line)
+        if current_size + line_len + 1 > limit:
+            if line_len > limit:
+                if current_chunk:
+                    chunks.append("\n".join(current_chunk))
+                    current_chunk = []
+                    current_size = 0
+                words = line.split()
+                temp_line = []
+                temp_size = 0
+                for word in words:
+                    if temp_size + len(word) + 1 > limit:
+                        chunks.append(" ".join(temp_line))
+                        temp_line = [word]
+                        temp_size = len(word) + 1
+                    else:
+                        temp_line.append(word)
+                        temp_size += len(word) + 1
+                if temp_line:
+                    current_chunk = [" ".join(temp_line)]
+                    current_size = len(current_chunk[0])
+            else:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = [line]
+                current_size = line_len
         else:
-            current_chunk.append(word)
-            current_length += len(word) + 1
+            current_chunk.append(line)
+            current_size += line_len + 1
+            
     if current_chunk:
-        chunks.append(" ".join(current_chunk))
+        chunks.append("\n".join(current_chunk))
     return chunks
 
 # Convert text chunk to speech
@@ -37,66 +60,113 @@ async def amain(text: str, file_name: str) -> None:
     await communicate.save(file_name)
 
 # Retry logic for each chunk conversion
-async def run_with_retries(text: str, file_name: str):
-    for attempt in range(MAX_RETRIES):
-        try:
-            await amain(text, file_name)
-            print(f"Chunk completed successfully, saved as {file_name}!")
-            break
-        except Exception as e:
-            print(f"Attempt {attempt + 1} failed: {e}")
-            if attempt < MAX_RETRIES - 1:
-                print(f"Retrying in {RETRY_DELAY} seconds...")
-                time.sleep(RETRY_DELAY)
-            else:
-                print("Max retries reached for this chunk.")
+async def run_with_retries(text: str, file_name: str, semaphore: asyncio.Semaphore):
+    async with semaphore:
+        for attempt in range(MAX_RETRIES):
+            try:
+                await amain(text, file_name)
+                print(f"Chunk saved: {file_name}")
+                return True
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed for {file_name}: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY)
+                else:
+                    print(f"Max retries reached for {file_name}.")
+                    return False
 
-# Concatenate all chunks into one MP3
+# Concatenate audio files purely with Python (No Pydub/FFmpeg required)
 def concatenate_audio(files, output_file):
-    combined = AudioSegment.empty()
-    for file in files:
-        audio = AudioSegment.from_file(file)
-        combined += audio
-    combined.export(output_file, format="mp3")
-    print(f"All chunks combined into {output_file}")
+    print(f"Combining {len(files)} audio files into {output_file}...")
+    try:
+        with open(output_file, 'wb') as outfile:
+            for fname in files:
+                with open(fname, 'rb') as infile:
+                    # Append binary data of each chunk
+                    outfile.write(infile.read())
+        
+        print(f"Successfully created {output_file}")
+        return True
+    except Exception as e:
+        print(f"CRITICAL ERROR: Failed to save final file {output_file}: {e}")
+        return False
 
 # Delete temporary chunk files
 def cleanup_files(files):
+    print("Cleaning up temporary chunk files...")
     for file in files:
         try:
-            os.remove(file)
-            print(f"Deleted temporary file {file}")
+            if os.path.exists(file):
+                 os.remove(file)
         except Exception as e:
             print(f"Error deleting file {file}: {e}")
 
-# Main function to handle file selection, text splitting, and combining audio
+# Sanitize filename
+def safe_filename(name):
+    return "".join([c for c in name if c.isalpha() or c.isdigit() or c in (' ', '-', '_')]).rstrip()
+
+async def process_single_file(file_path, semaphore):
+    print(f"Processing: {file_path}")
+    with open(file_path, "r", encoding="utf-8") as file:
+        user_text = file.read()
+    
+    if not user_text.strip():
+        print(f"Skipping empty file: {file_path}")
+        return
+
+    chunks = split_text(user_text, CHARACTER_LIMIT)
+    
+    raw_base_name = os.path.splitext(os.path.basename(file_path))[0]
+    base_name = safe_filename(raw_base_name)
+    output_filename = f"{base_name}.mp3"
+    
+    tasks = []
+    chunk_files_map = {} 
+
+    for idx, chunk in enumerate(chunks):
+        unique_id = uuid.uuid4().hex[:8]
+        file_name = f"{base_name}_{unique_id}_chunk_{idx+1}.mp3"
+        chunk_files_map[idx] = file_name
+        tasks.append(run_with_retries(chunk, file_name, semaphore))
+
+    results = await asyncio.gather(*tasks)
+
+    if not all(results):
+        print(f"Error: Some chunks failed to download for {base_name}. Aborting concatenation.")
+        return
+
+    ordered_files = [chunk_files_map[i] for i in range(len(chunks))]
+
+    success = False
+    try:
+        success = concatenate_audio(ordered_files, output_filename)
+        if not success:
+             print("Concatenation failed. Temporary files are preserved for debugging.")
+    except Exception as e:
+        print(f"Unexpected error during concatenation wrapper: {e}")
+    finally:
+        if success:
+             cleanup_files(ordered_files)
+        else:
+            print("Files kept due to failure or error.")
+
+async def process_all_files(file_paths):
+    semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
+    for file_path in file_paths:
+        await process_single_file(file_path, semaphore)
+
 if __name__ == "__main__":
-    # Open file dialog to select multiple text files
     root = Tk()
-    root.withdraw()  # Hide the root window
+    root.withdraw()
+    
     file_paths = filedialog.askopenfilenames(
         title="Select one or more text files",
         filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
     )
+    
+    root.destroy()
 
     if file_paths:
-        audio_files = []
-        
-        for file_path in file_paths:
-            with open(file_path, "r", encoding="utf-8") as file:
-                user_text = file.read()
-            
-            chunks = split_text(user_text, CHARACTER_LIMIT)
-            
-            for idx, chunk in enumerate(chunks):
-                file_name = f"{os.path.basename(file_path)}_chunk_{idx+1}.mp3"
-                asyncio.run(run_with_retries(chunk, file_name))
-                audio_files.append(file_name)
-
-        # Combine all generated audio chunks into one file
-        concatenate_audio(audio_files, OUTPUT_FILE)
-
-        # Delete temporary chunk files
-        cleanup_files(audio_files)
+        asyncio.run(process_all_files(file_paths))
     else:
         print("No files selected.")
